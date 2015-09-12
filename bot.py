@@ -1,18 +1,16 @@
 import sys
 import os
 import json
+import time
+import logging
 
-from twisted.internet import endpoints, reactor, protocol
-from twisted.words.protocols import irc
-from twisted.internet.task import LoopingCall
-from twisted.python import log
 import zmq
+import irc.client
 
 import settings
 
 
 class PluginInterface:
-
     def __init__(self, name, bot):
 
         logging.info("PluginInterface.__init__ %s", "ipc://ipc_plugin_" + name)
@@ -27,29 +25,44 @@ class PluginInterface:
         self._poller = zmq.Poller()
         self._poller.register(self._socket_plugin, zmq.POLLIN)
 
+        logging.info("PluginInterface.__init__ 2")
+
         self.bot.plugin_started(self)
 
+        logging.info("PluginInterface.__init__ 3")
+
     def _recieve(self, data):
-        log.msg("PluginInterface._recieve", data)
-        getattr(self.bot, data["function"])(*data["params"])
+        logging.info("PluginInterface._recieve %s", data)
+        server = data["params"][0]
+        if server not in self.bot.servers:
+            logging.error("PluginInterface._recieve %s not found", server)
+
+        if data["function"] in ["action", "admin", "cap", "ctcp", "ctcp_reply", "globops", "info", "invite", "ison",
+                                "join", "kick", "links", "list", "lusers", "mode", "motd", "names", "nick", "notice",
+                                "oper", "part", "pass_", "ping", "pong", "privmsg", "quit", "squit", "stats", "time",
+                                "topic", "trace", "user", "userhost", "users", "version", "wallops", "who", "whois",
+                                "whowas"]:
+            getattr(self.bot.servers[server], data["function"])(*data["params"][1:])
+        else:
+            logging.error("Undefined function %s called with %r", data["function"], data["params"])
 
     def _call(self, function, *args):
-        log.msg("PluginInterface._call", function, args)
+        logging.info("PluginInterface._call %s %s", function, args)
         self._socket_plugin.send_json({"function": function, "params": args})
 
-    def update(self):
+    def process_once(self, timeout=0):
         try:
-            socks = dict(self._poller.poll(timeout=0))
+            socks = dict(self._poller.poll(timeout=timeout))
         except KeyboardInterrupt:
             return
 
         if self._socket_plugin in socks:
-            log.msg("PluginInterface.update", self._socket_plugin)
+            logging.info("PluginInterface.update %s", self._socket_plugin)
             self._recieve(self._socket_plugin.recv_json())
 
     def __getattr__(self, name):
-        log.msg("PluginInterface.__getattr__", name)
-        if name in ["started", "onconnected", "joined", "privmsg"]:
+        logging.info("PluginInterface.__getattr__ %s", name)
+        if name in ["started", "update"]:
             def call(*args, **kwarg):
                 self._call(name, *args)
             return call
@@ -57,172 +70,74 @@ class PluginInterface:
             raise AttributeError(self, name)
 
 
-class Server(irc.IRCClient):
+class Bot:
+    def __init__(self):
 
-    def __init__(self, settings, plugins):
-        log.msg("Server.__init__")
-        self.nickname = settings['nickname']
-        self.realname = settings['realname']
-        self.username = settings['username']
-        self._name = None
-        self._settings = settings
-        self._plugins = plugins
+        logging.basicConfig(filename="Bot.log", level=logging.DEBUG)
 
-        self._encoding = "utf-8"
+        self.settings = settings.get_settings()
+        self.plugins = dict()
+        self.servers = dict()
+        print(self.settings)
+        self.reactor = irc.client.Reactor()
 
-    def connectionMade(self):
-        log.msg("Server.connectionMade")
-        irc.IRCClient.connectionMade(self)
+        self.reactor.add_global_handler("all_events", self._dispatcher, -10)
 
-    def connectionLost(self, reason):
-        for plugin in self._plugins.iterkeys():
-            plugin.ondisconnected(self._name)
-        log.msg("Server.connectionLost")
-
-    def signedOn(self):
-        log.msg("Server.signedOn " + self._name, self._plugins)
-
-        for plugin in self._plugins.iterkeys():
-            log.msg("ser " + str(plugin.onconnected))
-            plugin.onconnected(self._name)
-
-    # region Encoding overrides
-
-    def msg(self, user, message, length=None):
-        log.msg("Server.msg", user, type(message), length)
-        irc.IRCClient.msg(self, str(user), message.encode(self._encoding), length)
-
-    def topic(self, channel, topic=None):
-        log.msg("Server.topic", channel, type(topic))
-        irc.IRCClient.topic(self, channel, topic.encode(self._encoding))
-
-    def notice(self, user, message):
-        irc.IRCClient.notice(self, user, message.encode(self._encoding))
-
-    def away(self, message=''):
-        irc.IRCClient.away(self, message.encode(self._encoding))
-
-    def quit(self, message=''):
-        irc.IRCClient.quit(self, message.encode(self._encoding))
-
-    # endregion
-
-    def joined(self, channel):
-        log.msg("Server.joined", self._name, channel)
-        for plugin in self._plugins.iterkeys():
-            plugin.joined(self._name, channel)
-
-    def privmsg(self, user, channel, message):
-        log.msg("Server.privmsg", self._name, user, channel, message)
-        for plugin in self._plugins.iterkeys():
-            plugin.privmsg(self._name, user, channel, message.decode(self._encoding))
-
-    def irc_unknown(self, prefix, command, params):
-        if command == "INVITE":
-            for plugin in self._plugins.iterkeys():
-                plugin.invited(self._name, params[1])
-
-
-class Bot(protocol.ClientFactory):
-
-    def __init__(self, settings):
-        log.msg("Bot.__init__", settings)
-        self._settings = settings
-        self._servers = dict()
-        self._plugins = dict()
-        if 'plugins' in settings:
-            for plugin in self._settings['plugins']:
+        # Load plugins
+        if 'plugins' in self.settings:
+            for plugin in self.settings['plugins']:
                 self.plugin_load(plugin['name'], plugin['settings'])
 
-    def plugin_load(self, name, settings):
-        log.msg("Bot.plugin_load", name, settings)
-        plugin = PluginInterface(name, self)
-        file_name = "plugins/" + name + "/" + name + ".py"
-        if not os.path.isfile(file_name):
-            log.err("Unable to load plugin", name)
-        else:
-            log.msg("Bot.plugin_load plugin", plugin, name, self, sys.executable, [sys.executable, file_name])
-            #reactor.spawnProcess(plugin, sys.executable, args=[sys.executable, file_name], env={"PYTHONPATH": os.getcwd()})
-            os.spawnvpe(os.P_NOWAIT, sys.executable, args=[sys.executable, file_name], env={"PYTHONPATH": os.getcwd()})
-            update_loop = LoopingCall(plugin.update)
-            update_loop.start(0.1, now=True)
-            plugin._call("privmsg", "a", "b", "c", ".reverse reverse")
+        # Connect to servers
+        for server in self.settings['servers']:
+            logging.info("asdf %s", server)
+            s = self.reactor.server()
+            self.servers[server['name']] = s
+            s.name = server['name']
+            s.connect(server['host'], server['port'], nickname=self.settings['nickname'],
+                      ircname=self.settings['realname'], username=self.settings['username'])
 
-    def plugin_started(self, plugin):
-        log.msg("Bot.plugin_started", plugin, self._settings)
-
-        for p in self._settings['plugins']:
-            if p["name"] == plugin.name:
-                self._plugins[plugin] = p["settings"]
-
-        log.msg("Bot.plugin_started settings", self._plugins[plugin])
-
-        plugin.update_loop_call = LoopingCall(plugin.update)
-        plugin.started(json.dumps(self._plugins[plugin]))
-        plugin.update_loop_call.start(1, now=False)
-
-    def plugin_ended(self, plugin):
-        log.msg("Bot.plugin_ended", plugin)
-
-        if plugin not in self._plugins:
-            log.msg("Bot.plugin_ended already deleted")
+    def _dispatcher(self, connection, event):
+        if event.type == "all_raw_messages":
             return
 
-        name = plugin.name
-        settings = self._plugins[plugin]
+        for plugin in self.plugins:
+            plugin._call("on_" + event.type, connection.name, event.source, event.target, *event.arguments)
 
-        # Delete plugin
-        plugin.update_loop_call.stop()
-        del self._plugins[plugin]
+    def plugin_load(self, name, settings):
+        logging.info("Bot.plugin_load %s, %s", name, settings)
+        file_name = "plugins/" + name + "/" + name + ".py"
+        if not os.path.isfile(file_name):
+            logging.error("Unable to load plugin %s", name)
+        else:
+            logging.info("Bot.plugin_load plugin %s, %s, %s, %s", name, self, sys.executable,
+                         [sys.executable, file_name])
+            os.spawnvpe(os.P_NOWAIT, sys.executable, args=[sys.executable, file_name], env={"PYTHONPATH": os.getcwd()})
+            plugin = PluginInterface(name, self)
 
-        # Reload plugin
-        self.plugin_load(name, settings)
+    def plugin_started(self, plugin):
+        logging.info("Bot.plugin_started %s, %s", plugin, self.settings)
 
-    def say(self, server, channel, message):
-        log.msg("Bot.say", server, channel, message)
-        if server in self._servers:
-            # From https://tools.ietf.org/html/rfc1459 :
-            # IRC messages are always lines of characters terminated with a CR-LF
-            # (Carriage Return - Line Feed) pair, and these messages shall not
-            # exceed 512 characters in length, counting all characters including
-            # the trailing CR-LF. Thus, there are 510 characters maximum allowed
-            # for the command and its parameters.
-            max_length = 510 - 8 - len(channel) - 1 # 8 here is the length of
-                                                    # "PRIVMSG " and 1 is for
-                                                    # the space between the
-                                                    # target (channel) and the
-                                                    # actual message
-            self._servers[server].say(channel, message, max_length)
+        for p in self.settings['plugins']:
+            if p["name"] == plugin.name:
+                self.plugins[plugin] = p["settings"]
 
-    def join(self, server, channel):
-        log.msg("Bot.join " + server + ", " + channel)
-        if server in self._servers:
-            self._servers[server].join(str(channel))
+        logging.info("Bot.plugin_started settings %s", self.plugins[plugin])
 
-    def buildProtocol(self, addr):
-        log.msg("Bot.buildProtocol")
-        return Server(self._settings, self._plugins)
+        plugin.started(json.dumps(self.plugins[plugin]))
+        self.reactor.execute_every(1.0, plugin.update)
 
-    def connected(self, name, server):
-        log.msg("Bot.connected")
-        server._name = name
-        self._servers[name] = server
+    def run(self):
 
-    def clientConnectionLost(self, connector, reason):
-        log.msg("Bot.clientConnectionLost")
-        connector.connect()
+        while True:
+            self.reactor.process_once(timeout=0)
 
-    def clientConnectionFailed(self, connector, reason):
-        log.msg("Bot.clientConnectionFailed")
-        reactor.stop()
+            for plugin in self.plugins:
+                plugin.process_once(timeout=0)
+
+            time.sleep(0)  # yield
+
 
 if __name__ == '__main__':
-    log.startLogging(open('Bot.log', 'a'))
-    log.msg("main")
-    settings = settings.get_settings()
-    factory = Bot(settings)
-    for server in settings['servers']:
-        log.msg("main: creating endpoint for host:", server['host'], "port:", server['port'])
-        endpoint = endpoints.clientFromString(reactor, "tcp:host={}:port={}".format(server['host'], server['port']))
-        conn = endpoint.connect(factory).addCallback(lambda s: factory.connected(server['name'], s))
-    reactor.run()
+    bot = Bot()
+    bot.run()

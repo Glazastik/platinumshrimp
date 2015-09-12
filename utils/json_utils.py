@@ -7,8 +7,8 @@ def read_json(filename):
     def encode_dict(data):
         if type(data) == dict:
             return dict(map(encode_dict, pair) for pair in data.items())
-        elif type(data) == unicode:
-            return data.encode('utf-8')
+        #elif type(data) == unicode:
+        #    return data.encode('utf-8')
         else:
             return data
     if os.path.isfile(filename):
