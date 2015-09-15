@@ -12,5 +12,6 @@ def read_json(filename):
         else:
             return data
     if os.path.isfile(filename):
-        return json.load(open(filename, 'r'), object_hook=encode_dict)
+        with open(filename, 'r') as f:
+            return json.load(f, object_hook=encode_dict)
 
