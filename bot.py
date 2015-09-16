@@ -97,9 +97,16 @@ class Bot:
             s.connect(server['host'], server['port'], nickname=self.settings['nickname'],
                       ircname=self.settings['realname'], username=self.settings['username'])
 
+    def reconnect(self, connection):
+        if not connection.is_connected():
+            connection.reconnect()
+
     def _dispatcher(self, connection, event):
         if event.type == "all_raw_messages":
             return
+
+        if event.type == "disconnect":
+            connection.execute_delayed(30, self.reconnect, (connection,))
 
         for plugin in self.plugins:
             plugin._call("on_" + event.type, connection.name, event.source, event.target, *event.arguments)
