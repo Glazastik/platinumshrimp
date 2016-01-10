@@ -10,3 +10,7 @@ _trial_temp*/
 
 # PyCharm
 .idea/
+
+# Who needs these!
+*.log
+settings.json
